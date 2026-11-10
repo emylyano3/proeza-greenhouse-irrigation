@@ -24,6 +24,9 @@ bool isTimeToIrrigate ();
 void receiveMqttMessage(char* topic, uint8_t* payload, unsigned int length);
 void updateCronCommand(char* topic, unsigned char* payload, unsigned int length);
 bool changeStateCommand(char* topic, unsigned char* payload, unsigned int length);
+void publishCronField(uint8_t cronNo, uint8_t fieldNo);
+void publishCronState();
+bool isValidCronValue(uint8_t fieldNo, const char* value);
 
 void initSensor();
 void publishSensorData();
@@ -50,6 +53,7 @@ tCron           _irrCronExpressions[MAX_CRONS] = {
   {new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE]},
   {new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE]}
 };
+bool            _cronsLoaded          = false; // true once crons were read from flash (before that, expressions hold garbage)
 bool            _irrigating           = false;
 uint8_t         _currChannel          = 0;
 unsigned long   _irrLastScheduleCheck = -TIMER_CHECK_THRESHOLD_SECONDS * 1000;
@@ -106,6 +110,8 @@ void setup() {
   _domoticModule.setPortalSSID(chipname.c_str());
   _domoticModule.setFeedbackPin(LED_PIN);
   _domoticModule.setMqttMessageCallback(receiveMqttMessage);
+  // Every (re)connection to the broker republishes the cron state, so the home automation always knows the real config
+  _domoticModule.setMqttConnectionCallback(publishCronState);
   _domoticModule.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT);
   _domoticModule.setWifiConnectTimeout(WIFI_CONNECT_TIMEOUT);
   _domoticModule.setConfigFileSize(CONFIG_FILE_SIZE);
@@ -131,6 +137,11 @@ void initializeScheduling () {
   debug(F("Initializing scheduling"));
   for (uint8_t cronNo = 0; cronNo < MAX_CRONS; ++cronNo) {
     loadCronConf(cronNo);
+  }
+  _cronsLoaded = true;
+  // The broker connection may have been established before the crons were loaded (callback skipped it), so cover that case
+  if (_domoticModule.getMqttClient()->connected()) {
+    publishCronState();
   }
 }
 
@@ -267,17 +278,73 @@ void receiveMqttMessage(char* topic, unsigned char* payload, unsigned int length
   }
 }
 
+// Publishes (retained) the current value of one cron field. Retained so any subscriber, even one that connects later or
+// restarts, gets the real config immediately instead of waiting for someone to send a command.
+void publishCronField(uint8_t cronNo, uint8_t fieldNo) {
+  String topic = _domoticModule.getStationTopic("feedback/cron/") + String(cronNo) + "/" + String(fieldNo);
+  _domoticModule.getMqttClient()->publish(topic.c_str(), _irrCronExpressions[cronNo][fieldNo], true);
+}
+
+void publishCronState() {
+  if (!_cronsLoaded) {
+    return;
+  }
+  for (uint8_t cronNo = 0; cronNo < MAX_CRONS; ++cronNo) {
+    for (uint8_t fieldNo = 0; fieldNo < CRON_FIELDS; ++fieldNo) {
+      publishCronField(cronNo, fieldNo);
+    }
+  }
+}
+
+// Minutes and hours must be '*' or a number in range. Other fields accept names (JAN, MON...) or '?', so only length is checked.
+bool isValidCronValue(uint8_t fieldNo, const char* value) {
+  size_t len = strlen(value);
+  if (len == 0 || len > CRON_FIELD_SIZE) {
+    return false;
+  }
+  if (fieldNo != 1 && fieldNo != 2) {
+    return true;
+  }
+  if (len == 1 && value[0] == '*') {
+    return true;
+  }
+  for (size_t i = 0; i < len; ++i) {
+    if (value[i] < '0' || value[i] > '9') {
+      return false;
+    }
+  }
+  int number = atoi(value);
+  return number <= (fieldNo == 1 ? 59 : 23);
+}
+
 void updateCronCommand (char* topic, unsigned char* payload, unsigned int length) {
-  std::string tail = std::string(topic).substr(_domoticModule.getStationTopic("command/cron/").length());
-  size_t cronID = atoi(tail.substr(0, tail.find("/")).c_str());
-  size_t fieldID = atoi(tail.substr(tail.find("/") + 1).c_str());
-  char value[length + 1];
-  strcpy(value, (char*) payload);
-  value[length] = '\0'; // to treat payload as string
-  updateCronField(cronID, fieldID, value);
-  saveCronConf(cronID);
-  String feedbackTopic = _domoticModule.getStationTopic("feedback/cron/") + tail.c_str();
-  _domoticModule.getMqttClient()->publish(feedbackTopic.c_str(), value);
+  // Expected topic tail: <cronNo>/<fieldNo>
+  String prefix = _domoticModule.getStationTopic("command/cron/");
+  const char* tail = topic + prefix.length();
+  char* end;
+  long cronID = strtol(tail, &end, 10);
+  if (end == tail || *end != '/') {
+    debug(F("Invalid cron topic"), topic);
+    return;
+  }
+  const char* fieldStart = end + 1;
+  long fieldID = strtol(fieldStart, &end, 10);
+  if (end == fieldStart || *end != '\0' || cronID < 0 || cronID >= MAX_CRONS || fieldID < 0 || fieldID >= (long) CRON_FIELDS) {
+    debug(F("Cron or field out of range"), topic);
+    return;
+  }
+  char value[CRON_FIELD_STRING_SIZE] = {'\0'};
+  if (length > 0 && length <= CRON_FIELD_SIZE) {
+    memcpy(value, payload, length); // payload is not guaranteed to be null terminated
+  }
+  if (isValidCronValue(fieldID, value)) {
+    updateCronField(cronID, fieldID, value);
+    saveCronConf(cronID);
+  } else {
+    debug(F("Invalid cron value rejected for"), topic);
+  }
+  // Always answer with the real value: confirms an accepted change and makes subscribers revert a rejected one
+  publishCronField(cronID, fieldID);
 }
 
 void loadCronConf(uint8_t cronNo) {
@@ -311,7 +378,8 @@ void loadCronConf(uint8_t cronNo) {
 
 void updateCronField(uint8_t cronNo, uint8_t fieldNo, const char* value) {
   debug(F("Updating cron ["), cronNo, F("] field ["), CRON_FIELDS_NAMES[fieldNo], F("] with value:"), value);
-  strcpy(_irrCronExpressions[cronNo][fieldNo], value);
+  strncpy(_irrCronExpressions[cronNo][fieldNo], value, CRON_FIELD_SIZE);
+  _irrCronExpressions[cronNo][fieldNo][CRON_FIELD_SIZE] = '\0';
 }
 
 bool saveCronConf (uint8_t cronNo) {
