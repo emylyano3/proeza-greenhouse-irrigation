@@ -27,6 +27,13 @@ bool changeStateCommand(char* topic, unsigned char* payload, unsigned int length
 void publishCronField(uint8_t cronNo, uint8_t fieldNo);
 void publishCronState();
 bool isValidCronValue(uint8_t fieldNo, const char* value);
+void publishCronEnabled(uint8_t cronNo);
+void updateCronEnableCommand(uint8_t cronNo, unsigned char* payload, unsigned int length);
+bool cronMatches(uint8_t cronNo, struct tm* ptm, const char* mon, const char* dow);
+void publishModuleState();
+void publishChannelTimer(Channel *channel);
+void publishChannelTimers();
+void handleChannelTimerCommand(const std::string& receivedTopic);
 
 void initSensor();
 void publishSensorData();
@@ -44,6 +51,7 @@ const char*   CRONS_CONF_FILES[]      = {"CRON_0.conf", "CRON_1.conf", "CRON_2.c
 const size_t  CRON_FIELD_STRING_SIZE  = CRON_FIELD_SIZE + 1;
 const size_t  CRON_FIELDS             = 6;
 const char*   CRON_FIELDS_NAMES[]     = {"SEC", "MIN", "HOU", "DOM", "MON", "DOW"};
+const char*   CRON_ENABLE_TOPIC       = "enable"; // command/cron/<n>/enable and feedback/cron/<n>/enable
 
 const char* MODULE_TYPE               = "irrigation";
 
@@ -53,6 +61,7 @@ tCron           _irrCronExpressions[MAX_CRONS] = {
   {new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE]},
   {new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE], new char[CRON_FIELD_STRING_SIZE]}
 };
+bool            _cronEnabled[MAX_CRONS] = {false}; // a disabled cron is never evaluated by the scheduler
 bool            _cronsLoaded          = false; // true once crons were read from flash (before that, expressions hold garbage)
 bool            _irrigating           = false;
 uint8_t         _currChannel          = 0;
@@ -110,8 +119,9 @@ void setup() {
   _domoticModule.setPortalSSID(chipname.c_str());
   _domoticModule.setFeedbackPin(LED_PIN);
   _domoticModule.setMqttMessageCallback(receiveMqttMessage);
-  // Every (re)connection to the broker republishes the cron state, so the home automation always knows the real config
-  _domoticModule.setMqttConnectionCallback(publishCronState);
+  // Every (re)connection to the broker republishes the cron state and the channel timers, so the home automation always
+  // knows the real config
+  _domoticModule.setMqttConnectionCallback(publishModuleState);
   _domoticModule.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT);
   _domoticModule.setWifiConnectTimeout(WIFI_CONNECT_TIMEOUT);
   _domoticModule.setConfigFileSize(CONFIG_FILE_SIZE);
@@ -228,6 +238,28 @@ bool isTimeToCheckSchedule () {
   return isTime;
 }
 
+// True when the cron expression matches the given moment. Whether the cron is enabled is up to the caller.
+bool cronMatches(uint8_t cronNo, struct tm* ptm, const char* mon, const char* dow) {
+  bool tti = true;
+  tti &= _irrCronExpressions[cronNo][1][0] == '*' 
+                    || atoi(_irrCronExpressions[cronNo][1]) == ptm->tm_min 
+                    || (  
+                        ptm->tm_min > atoi(_irrCronExpressions[cronNo][1]) 
+                        && 
+                        ptm->tm_min - (TIMER_CHECK_THRESHOLD_SECONDS / 60) <= atoi(_irrCronExpressions[cronNo][1])
+                      ); // Minute
+  tti &= _irrCronExpressions[cronNo][2][0] == '*' 
+                    || atoi(_irrCronExpressions[cronNo][2]) == ptm->tm_hour; // Hour
+  tti &= _irrCronExpressions[cronNo][3][0] == '*' 
+                    || atoi(_irrCronExpressions[cronNo][3]) == ptm->tm_mday; // Day of month
+  tti &= _irrCronExpressions[cronNo][4][0] == '*' 
+                    || strncasecmp(mon, _irrCronExpressions[cronNo][4], CRON_FIELD_SIZE) == 0 
+                    || atoi(_irrCronExpressions[cronNo][4]) == ptm->tm_mon + 1; // Month
+  tti &= _irrCronExpressions[cronNo][5][0] == '?'
+                    || strncasecmp(dow, _irrCronExpressions[cronNo][5], CRON_FIELD_SIZE) == 0
+                    || atoi(_irrCronExpressions[cronNo][5]) == ptm->tm_wday + 1; // Day of week
+  return tti;
+}
 bool isTimeToIrrigate () {
   debug(F("Checking if it is time to start irrigation"));
   time_t now = time(nullptr);
@@ -236,30 +268,11 @@ bool isTimeToIrrigate () {
   const char* mon = ptm->tm_mon < 12 ? MONTHS_OF_YEAR[ptm->tm_mon] : "";
   const char* dow = ptm->tm_wday < 7 ? DAYS_OF_WEEK[ptm->tm_wday] : "";
   // Evaluates cron at minute level. Seconds granularity is not needed for irrigarion scheduling.
-  boolean tti;
-  uint8_t cronNo = 0;
-  do {
-    tti = true;
-    tti &= _irrCronExpressions[cronNo][1][0] == '*' 
-                      || atoi(_irrCronExpressions[cronNo][1]) == ptm->tm_min 
-                      || (  
-                          ptm->tm_min > atoi(_irrCronExpressions[cronNo][1]) 
-                          && 
-                          ptm->tm_min - (TIMER_CHECK_THRESHOLD_SECONDS / 60) <= atoi(_irrCronExpressions[cronNo][1])
-                        ); // Minute
-    tti &= _irrCronExpressions[cronNo][2][0] == '*' 
-                      || atoi(_irrCronExpressions[cronNo][2]) == ptm->tm_hour; // Hour
-    tti &= _irrCronExpressions[cronNo][3][0] == '*' 
-                      || atoi(_irrCronExpressions[cronNo][3]) == ptm->tm_mday; // Day of month
-    tti &= _irrCronExpressions[cronNo][4][0] == '*' 
-                      || strncasecmp(mon, _irrCronExpressions[cronNo][4], CRON_FIELD_SIZE) == 0 
-                      || atoi(_irrCronExpressions[cronNo][4]) == ptm->tm_mon + 1; // Month
-    tti &= _irrCronExpressions[cronNo][5][0] == '?'
-                      || strncasecmp(dow, _irrCronExpressions[cronNo][5], CRON_FIELD_SIZE) == 0
-                      || atoi(_irrCronExpressions[cronNo][5]) == ptm->tm_wday + 1; // Day of week
+  boolean tti = false;
+  for (uint8_t cronNo = 0; cronNo < MAX_CRONS && !tti; ++cronNo) {
     debug(F("Checking cron"), cronNo);
-    ++cronNo;
-  } while (!tti && cronNo < MAX_CRONS);
+    tti = _cronEnabled[cronNo] && cronMatches(cronNo, ptm, mon, dow);
+  }
   debug(F("IS TTI?"), tti ? "YES" : "NO");
   return tti;
 }
@@ -274,7 +287,36 @@ void receiveMqttMessage(char* topic, unsigned char* payload, unsigned int length
     changeStateCommand(topic, payload, length);
     _domoticModule.getMqttClient()->publish(_domoticModule.getStationTopic("feedback/state").c_str(), _irrigating ? "1" : "0");
   } else {
-    debug(F("Not a station topic"));
+    handleChannelTimerCommand(receivedTopic);
+  }
+}
+
+// The library already applied (and saved) the new timer before this callback runs; here it is only echoed back, retained.
+void handleChannelTimerCommand(const std::string& receivedTopic) {
+  for (uint8_t i = 0; i < _domoticModule.getChannelsCount(); ++i) {
+    Channel *channel = _domoticModule.getChannel(i);
+    if (receivedTopic == _domoticModule.getChannelTopic(channel, "command/timer").c_str()) {
+      publishChannelTimer(channel);
+      return;
+    }
+  }
+}
+
+void publishModuleState() {
+  publishChannelTimers();
+  publishCronState();
+}
+
+// Publishes (retained) the channel timer in seconds, the same unit command/timer receives. Retained for the same reason
+// as the cron fields: a subscriber that connects later or restarts gets the real value without sending a command.
+void publishChannelTimer(Channel *channel) {
+  _domoticModule.getMqttClient()->publish(_domoticModule.getChannelTopic(channel, "feedback/timer").c_str(),
+                                          String(channel->timer / 1000).c_str(), true);
+}
+
+void publishChannelTimers() {
+  for (uint8_t i = 0; i < _domoticModule.getChannelsCount(); ++i) {
+    publishChannelTimer(_domoticModule.getChannel(i));
   }
 }
 
@@ -285,11 +327,17 @@ void publishCronField(uint8_t cronNo, uint8_t fieldNo) {
   _domoticModule.getMqttClient()->publish(topic.c_str(), _irrCronExpressions[cronNo][fieldNo], true);
 }
 
+void publishCronEnabled(uint8_t cronNo) {
+  String topic = _domoticModule.getStationTopic("feedback/cron/") + String(cronNo) + "/" + CRON_ENABLE_TOPIC;
+  _domoticModule.getMqttClient()->publish(topic.c_str(), _cronEnabled[cronNo] ? "1" : "0", true);
+}
+
 void publishCronState() {
   if (!_cronsLoaded) {
     return;
   }
   for (uint8_t cronNo = 0; cronNo < MAX_CRONS; ++cronNo) {
+    publishCronEnabled(cronNo);
     for (uint8_t fieldNo = 0; fieldNo < CRON_FIELDS; ++fieldNo) {
       publishCronField(cronNo, fieldNo);
     }
@@ -317,19 +365,38 @@ bool isValidCronValue(uint8_t fieldNo, const char* value) {
   return number <= (fieldNo == 1 ? 59 : 23);
 }
 
+// Enables or disables a whole cron. Payload "1" / "0" (same convention as the channels enable command).
+void updateCronEnableCommand(uint8_t cronNo, unsigned char* payload, unsigned int length) {
+  if (length == 1 && (payload[0] == '0' || payload[0] == '1')) {
+    bool enabled = payload[0] == '1';
+    if (enabled != _cronEnabled[cronNo]) {
+      _cronEnabled[cronNo] = enabled;
+      saveCronConf(cronNo);
+    }
+  } else {
+    debug(F("Invalid cron enable payload for cron"), cronNo);
+  }
+  // Always answer with the real value, so subscribers revert a rejected command
+  publishCronEnabled(cronNo);
+}
+
 void updateCronCommand (char* topic, unsigned char* payload, unsigned int length) {
-  // Expected topic tail: <cronNo>/<fieldNo>
+  // Expected topic tail: <cronNo>/<fieldNo> or <cronNo>/enable
   String prefix = _domoticModule.getStationTopic("command/cron/");
   const char* tail = topic + prefix.length();
   char* end;
   long cronID = strtol(tail, &end, 10);
-  if (end == tail || *end != '/') {
+  if (end == tail || *end != '/' || cronID < 0 || cronID >= MAX_CRONS) {
     debug(F("Invalid cron topic"), topic);
     return;
   }
   const char* fieldStart = end + 1;
+  if (strcmp(fieldStart, CRON_ENABLE_TOPIC) == 0) {
+    updateCronEnableCommand(cronID, payload, length);
+    return;
+  }
   long fieldID = strtol(fieldStart, &end, 10);
-  if (end == fieldStart || *end != '\0' || cronID < 0 || cronID >= MAX_CRONS || fieldID < 0 || fieldID >= (long) CRON_FIELDS) {
+  if (end == fieldStart || *end != '\0' || fieldID < 0 || fieldID >= (long) CRON_FIELDS) {
     debug(F("Cron or field out of range"), topic);
     return;
   }
@@ -350,10 +417,12 @@ void updateCronCommand (char* topic, unsigned char* payload, unsigned int length
 void loadCronConf(uint8_t cronNo) {
   debug(F("Getting configuration for cron number"), cronNo);
   char* conf = _domoticModule.getConf(CRONS_CONF_FILES[cronNo]);
+  // Confs saved before the enable flag existed have no 7th token: those crons were all active, so they stay enabled
+  _cronEnabled[cronNo] = true;
   if (conf) {
     debug(F("Cron conf loaded"), conf);
     size_t i = 0, chunkNo = 0, length = strlen(conf);
-    while (i < length && chunkNo < CRON_FIELDS) {
+    while (i < length && chunkNo <= CRON_FIELDS) {
       if (conf[i] == ' ') {
         ++i;
       } else {
@@ -361,7 +430,12 @@ void loadCronConf(uint8_t cronNo) {
         int j = 0;
         while (i < length && conf[i] != ' ' && j < CRON_FIELD_SIZE) 
           value[j++] = conf[i++];
-        updateCronField(cronNo, chunkNo++, value);
+        if (chunkNo < CRON_FIELDS) {
+          updateCronField(cronNo, chunkNo, value);
+        } else {
+          _cronEnabled[cronNo] = value[0] != '0';
+        }
+        ++chunkNo;
       }
     }
     delete[] conf;
@@ -373,6 +447,7 @@ void loadCronConf(uint8_t cronNo) {
     updateCronField(cronNo, 3, "*");
     updateCronField(cronNo, 4, "*");
     updateCronField(cronNo, 5, "?");
+    _cronEnabled[cronNo] = cronNo == 0; // a fresh module starts with a single active cron
   }
 }
 
@@ -383,16 +458,17 @@ void updateCronField(uint8_t cronNo, uint8_t fieldNo, const char* value) {
 }
 
 bool saveCronConf (uint8_t cronNo) {
-  char toSave[CRON_FIELDS * CRON_FIELD_SIZE + CRON_FIELDS] = {'\0'}; //fields size + spaces + end char
+  // 6 cron fields + enabled flag, space separated. The 7th token is ignored by firmwares that predate the enable flag.
+  char toSave[CRON_FIELDS * CRON_FIELD_SIZE + CRON_FIELDS + 2] = {'\0'}; //fields size + spaces + enabled flag + end char
   size_t cursor = 0;
   for (size_t fieldNo = 0; fieldNo < CRON_FIELDS; ++fieldNo) {
     size_t i = 0;
     while (i < CRON_FIELD_SIZE && _irrCronExpressions[cronNo][fieldNo][i] != '\0') {
       toSave[cursor++] = _irrCronExpressions[cronNo][fieldNo][i++];
     }
-    if (fieldNo != CRON_FIELDS - 1) 
-      toSave[cursor++]= ' '; //no space after last field
+    toSave[cursor++]= ' ';
   }
+  toSave[cursor++] = _cronEnabled[cronNo] ? '1' : '0';
   debug(F("Saving cron"), cronNo, F(" conf: "), toSave);
   return _domoticModule.updateConf(CRONS_CONF_FILES[cronNo], toSave);
 }
