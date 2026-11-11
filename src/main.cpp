@@ -30,6 +30,10 @@ bool isValidCronValue(uint8_t fieldNo, const char* value);
 void publishCronEnabled(uint8_t cronNo);
 void updateCronEnableCommand(uint8_t cronNo, unsigned char* payload, unsigned int length);
 bool cronMatches(uint8_t cronNo, struct tm* ptm, const char* mon, const char* dow);
+void publishModuleState();
+void publishChannelTimer(Channel *channel);
+void publishChannelTimers();
+void handleChannelTimerCommand(const std::string& receivedTopic);
 
 void initSensor();
 void publishSensorData();
@@ -115,8 +119,9 @@ void setup() {
   _domoticModule.setPortalSSID(chipname.c_str());
   _domoticModule.setFeedbackPin(LED_PIN);
   _domoticModule.setMqttMessageCallback(receiveMqttMessage);
-  // Every (re)connection to the broker republishes the cron state, so the home automation always knows the real config
-  _domoticModule.setMqttConnectionCallback(publishCronState);
+  // Every (re)connection to the broker republishes the cron state and the channel timers, so the home automation always
+  // knows the real config
+  _domoticModule.setMqttConnectionCallback(publishModuleState);
   _domoticModule.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT);
   _domoticModule.setWifiConnectTimeout(WIFI_CONNECT_TIMEOUT);
   _domoticModule.setConfigFileSize(CONFIG_FILE_SIZE);
@@ -282,7 +287,36 @@ void receiveMqttMessage(char* topic, unsigned char* payload, unsigned int length
     changeStateCommand(topic, payload, length);
     _domoticModule.getMqttClient()->publish(_domoticModule.getStationTopic("feedback/state").c_str(), _irrigating ? "1" : "0");
   } else {
-    debug(F("Not a station topic"));
+    handleChannelTimerCommand(receivedTopic);
+  }
+}
+
+// The library already applied (and saved) the new timer before this callback runs; here it is only echoed back, retained.
+void handleChannelTimerCommand(const std::string& receivedTopic) {
+  for (uint8_t i = 0; i < _domoticModule.getChannelsCount(); ++i) {
+    Channel *channel = _domoticModule.getChannel(i);
+    if (receivedTopic == _domoticModule.getChannelTopic(channel, "command/timer").c_str()) {
+      publishChannelTimer(channel);
+      return;
+    }
+  }
+}
+
+void publishModuleState() {
+  publishChannelTimers();
+  publishCronState();
+}
+
+// Publishes (retained) the channel timer in seconds, the same unit command/timer receives. Retained for the same reason
+// as the cron fields: a subscriber that connects later or restarts gets the real value without sending a command.
+void publishChannelTimer(Channel *channel) {
+  _domoticModule.getMqttClient()->publish(_domoticModule.getChannelTopic(channel, "feedback/timer").c_str(),
+                                          String(channel->timer / 1000).c_str(), true);
+}
+
+void publishChannelTimers() {
+  for (uint8_t i = 0; i < _domoticModule.getChannelsCount(); ++i) {
+    publishChannelTimer(_domoticModule.getChannel(i));
   }
 }
 
